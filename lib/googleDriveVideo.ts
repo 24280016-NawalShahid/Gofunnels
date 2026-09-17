@@ -1,5 +1,4 @@
 import { chromium } from "playwright";
-import { createWriteStream } from "fs";
 import { open, rm } from "fs/promises";
 import os from "os";
 import path from "path";
@@ -38,6 +37,23 @@ type MediaCandidate = {
   contentType: string;
   total?: number;
 };
+
+const MEDIA_URL_HINTS = [
+  "videoplayback",
+  "googlevideo.com",
+  "get_video_info",
+  "get_video_play_info",
+  "/media/",
+  "docs.google.com/uc",
+];
+
+function looksLikeMedia(contentType: string, url: string): boolean {
+  if (contentType.includes("video") || contentType.includes("audio")) return true;
+  if (contentType === "application/octet-stream" || contentType === "binary/octet-stream") {
+    return MEDIA_URL_HINTS.some((hint) => url.includes(hint));
+  }
+  return false;
+}
 
 const CHUNK_SIZE = 32 * 1024 * 1024; // 32MB per range request
 
@@ -101,8 +117,76 @@ async function downloadRanged(
   }
 }
 
+async function buildDiagnostics(
+  page: import("playwright").Page,
+  seenTypes: Map<string, number>,
+  interestingUrls: string[]
+): Promise<string> {
+  const parts: string[] = [];
+
+  try {
+    parts.push(`page title: "${await page.title()}"`);
+  } catch {
+    parts.push("page title: <could not read>");
+  }
+
+  try {
+    const bodyText = await page.evaluate(() =>
+      document.body?.innerText?.slice(0, 300).replace(/\s+/g, " ").trim()
+    );
+    if (bodyText) parts.push(`visible text (first 300 chars): "${bodyText}"`);
+  } catch {
+    // ignore
+  }
+
+  try {
+    const videoCount = await page.locator("video").count();
+    parts.push(`<video> elements on main frame: ${videoCount}`);
+  } catch {
+    // ignore
+  }
+
+  try {
+    const iframeSrcs = await page.locator("iframe").evaluateAll((els) =>
+      els.map((el) => (el as HTMLIFrameElement).src).filter(Boolean)
+    );
+    if (iframeSrcs.length) {
+      parts.push(`iframes found: ${iframeSrcs.slice(0, 5).join(", ")}`);
+    }
+  } catch {
+    // ignore
+  }
+
+  if (seenTypes.size > 0) {
+    const typesList = [...seenTypes.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([t, n]) => `${t} (x${n})`)
+      .join(", ");
+    parts.push(`response content-types seen: ${typesList}`);
+  } else {
+    parts.push("no network responses were observed at all — the page may not have loaded.");
+  }
+
+  if (interestingUrls.length > 0) {
+    parts.push(
+      `URLs with video/media-like hints: ${interestingUrls.slice(0, 5).join(" | ")}`
+    );
+  }
+
+  try {
+    const screenshotPath = path.join(os.tmpdir(), `drive-debug-${randomUUID()}.png`);
+    await page.screenshot({ path: screenshotPath });
+    parts.push(`screenshot saved to: ${screenshotPath}`);
+  } catch {
+    // ignore
+  }
+
+  return parts.join(" | ");
+}
+
 /**
- * Uses a previously saved Google login session to load a Drive/Vids "play"
+ * Uses a previously saved Google login session to load a Drive/Vids video
  * page, discover the underlying media URL the player streams from, and
  * download it to a local temp file. Returns the path to that file.
  *
@@ -122,13 +206,24 @@ export async function fetchGoogleDriveVideo(fileId: string): Promise<string> {
   const page = await context.newPage();
 
   const candidates = new Map<string, MediaCandidate>();
+  const seenTypes = new Map<string, number>();
+  const interestingUrls: string[] = [];
 
   page.on("response", (response) => {
     const headers = response.headers();
-    const contentType = headers["content-type"] || "";
-    if (!contentType.startsWith("video/") && !contentType.startsWith("audio/")) {
-      return;
+    const contentType = (headers["content-type"] || "").split(";")[0].trim();
+    seenTypes.set(contentType || "(none)", (seenTypes.get(contentType || "(none)") ?? 0) + 1);
+
+    const url = response.url();
+    if (
+      interestingUrls.length < 20 &&
+      MEDIA_URL_HINTS.some((hint) => url.includes(hint))
+    ) {
+      interestingUrls.push(url);
     }
+
+    if (!looksLikeMedia(contentType, url)) return;
+
     let total: number | undefined;
     const contentRange = headers["content-range"];
     if (contentRange) {
@@ -137,9 +232,9 @@ export async function fetchGoogleDriveVideo(fileId: string): Promise<string> {
     } else if (headers["content-length"]) {
       total = parseInt(headers["content-length"], 10);
     }
-    const existing = candidates.get(response.url());
+    const existing = candidates.get(url);
     if (!existing || (total ?? 0) > (existing.total ?? 0)) {
-      candidates.set(response.url(), { url: response.url(), contentType, total });
+      candidates.set(url, { url, contentType, total });
     }
   });
 
@@ -148,18 +243,30 @@ export async function fetchGoogleDriveVideo(fileId: string): Promise<string> {
   try {
     await page.goto(playUrl, { waitUntil: "load", timeout: 60000 });
 
+    // Programmatic play() often fails silently (no src loaded yet, or
+    // browsers block autoplay without a real user gesture). Try both a
+    // direct call and a real click in the middle of the viewport, which
+    // usually lands on a big play-button overlay.
     try {
       await page.locator("video").first().evaluate((el: HTMLVideoElement) => el.play());
     } catch {
-      // Player may need a click instead of programmatic play(); ignore and
-      // rely on whatever autoplay/preload traffic already happened.
+      // ignore
+    }
+    try {
+      const box = await page.viewportSize();
+      if (box) {
+        await page.mouse.click(box.width / 2, box.height / 2);
+      }
+    } catch {
+      // ignore
     }
 
-    await page.waitForTimeout(6000);
+    await page.waitForTimeout(10000);
 
     if (candidates.size === 0) {
+      const diagnostics = await buildDiagnostics(page, seenTypes, interestingUrls);
       throw new Error(
-        "Could not find a playable video stream on that page. Either this account doesn't have view access, or Google's player has changed."
+        `Could not find a playable video stream on that page. Diagnostics: ${diagnostics}`
       );
     }
 
