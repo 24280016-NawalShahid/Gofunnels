@@ -11,29 +11,55 @@ find the part you need.
 - Copy the transcript to clipboard or download it as a `.txt` file.
 - Toggle timestamps on/off.
 
-## Run it locally
+## Run it on your laptop
+
+Requires [Node.js](https://nodejs.org) 18 or newer.
 
 ```bash
+git clone https://github.com/24280016-NawalShahid/Gofunnels.git
+cd Gofunnels
+git checkout claude/google-video-transcript-app-hau86s
 npm install
 npm run dev
 ```
 
-Open http://localhost:3000, paste a link, and click **Get transcript**.
+Open **http://localhost:3000**, paste a YouTube link, and click **Get
+transcript**.
 
-## Deploy it so your colleagues can use it
+## Sharing it with colleagues from your laptop
 
-This is a standard Next.js app, so the fastest way to get a shareable URL
-is [Vercel](https://vercel.com) (free tier is enough for internal tools):
+Your laptop has to stay on and running the server for either option below.
 
-1. Push this repo to GitHub (already done if you're reading this from the repo).
-2. Go to https://vercel.com/new, import the repo, and click **Deploy**.
-   No environment variables or extra configuration are required.
-3. Vercel gives you a URL like `https://your-project.vercel.app` — share
-   that with your team. Every teammate can use it directly from their
-   browser; nothing to install.
+**Option A — same office/WiFi network (simplest):**
 
-Any other Node hosting works too (Render, Railway, a company server, etc.) —
-just run `npm run build && npm run start`.
+```bash
+npm run dev:lan
+```
+
+Then find your laptop's local IP address:
+- macOS: `ipconfig getifaddr en0`
+- Windows (PowerShell): `ipconfig` (look for "IPv4 Address")
+- Linux: `hostname -I`
+
+Share `http://<your-ip>:3000` (e.g. `http://192.168.1.42:3000`) — anyone
+on the same network/VPN can open it directly. For a steadier version, run
+`npm run build` once, then `npm run start:lan` instead of `dev:lan`.
+
+**Option B — colleagues outside your network:**
+
+Use a tunnel to get a temporary public URL that forwards to your laptop:
+
+```bash
+npm run build && npm run start   # in one terminal
+npx localtunnel --port 3000      # in another terminal
+```
+
+This prints a public `https://...loca.lt` URL you can share. (Alternatives:
+`ngrok http 3000` if you have an ngrok account, or Cloudflare Tunnel.)
+
+**Longer-term:** for something colleagues can reach without your laptop
+being on, deploy it to a host like Vercel/Render/Railway instead — ask if
+you want that set up later.
 
 ## How it works
 
