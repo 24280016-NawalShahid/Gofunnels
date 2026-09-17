@@ -21,6 +21,9 @@ yarn-error.log*
 .env*.local
 .env
 
+# Google login session (sensitive — created by `npm run connect-google`)
+.google-session.json
+
 # vercel
 .vercel
 

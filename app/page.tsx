@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type LinkSegment = {
   start: number;
@@ -9,15 +9,15 @@ type LinkSegment = {
   text: string;
 };
 
-type UploadChunk = {
+type Chunk = {
   start: number;
   end: number;
   text: string;
 };
 
 type TranscriptResult =
-  | { mode: "link"; videoId: string; segments: LinkSegment[]; fullText: string }
-  | { mode: "upload"; fullText: string; chunks: UploadChunk[] };
+  | { mode: "youtube"; videoId: string; segments: LinkSegment[]; fullText: string }
+  | { mode: "drive" | "upload"; fullText: string; chunks: Chunk[] };
 
 function formatSeconds(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
@@ -30,19 +30,35 @@ function formatSeconds(totalSeconds: number): string {
     : `${minutes}:${pad(seconds)}`;
 }
 
+function detectLinkType(input: string): "youtube" | "drive" | "unknown" {
+  const trimmed = input.trim();
+  try {
+    const url = new URL(trimmed);
+    const host = url.hostname.replace(/^www\./, "").replace(/^m\./, "");
+    if (host === "youtube.com" || host === "youtu.be" || host === "music.youtube.com") {
+      return "youtube";
+    }
+    if (host === "docs.google.com" || host === "drive.google.com") {
+      return "drive";
+    }
+  } catch {
+    // not a URL at all
+  }
+  return "unknown";
+}
+
 export default function Home() {
-  const [tab, setTab] = useState<"link" | "upload">("upload");
+  const [tab, setTab] = useState<"link" | "upload">("link");
 
   // Link mode state
   const [url, setUrl] = useState("");
+  const [googleConnected, setGoogleConnected] = useState<boolean | null>(null);
 
   // Upload mode state
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
-  const [phase, setPhase] = useState<"idle" | "uploading" | "transcribing">(
-    "idle"
-  );
+  const [phase, setPhase] = useState<"idle" | "uploading" | "working">("idle");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
 
@@ -53,15 +69,20 @@ export default function Home() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [copied, setCopied] = useState(false);
 
+  useEffect(() => {
+    fetch("/api/google-status")
+      .then((r) => r.json())
+      .then((d) => setGoogleConnected(Boolean(d.connected)))
+      .catch(() => setGoogleConnected(false));
+  }, []);
+
   const displayText = useMemo(() => {
     if (!result) return "";
     if (!showTimestamps) return result.fullText;
-    if (result.mode === "link") {
+    if (result.mode === "youtube") {
       return result.segments.map((s) => `[${s.timestamp}] ${s.text}`).join("\n");
     }
-    return result.chunks
-      .map((c) => `[${formatSeconds(c.start)}] ${c.text}`)
-      .join("\n");
+    return result.chunks.map((c) => `[${formatSeconds(c.start)}] ${c.text}`).join("\n");
   }, [result, showTimestamps]);
 
   function resetOutputs() {
@@ -74,11 +95,21 @@ export default function Home() {
     e.preventDefault();
     if (!url.trim()) return;
 
+    const linkType = detectLinkType(url);
+    if (linkType === "unknown") {
+      resetOutputs();
+      setError(
+        "That doesn't look like a YouTube or Google Drive/Vids link. Paste a full URL, or use the Upload tab instead."
+      );
+      return;
+    }
+
     setLoading(true);
     resetOutputs();
 
     try {
-      const res = await fetch("/api/transcript", {
+      const endpoint = linkType === "youtube" ? "/api/transcript" : "/api/transcribe-drive-link";
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -90,7 +121,11 @@ export default function Home() {
         return;
       }
 
-      setResult({ mode: "link", ...data });
+      if (linkType === "youtube") {
+        setResult({ mode: "youtube", ...data });
+      } else {
+        setResult({ mode: "drive", fullText: data.fullText, chunks: data.chunks });
+      }
     } catch {
       setError("Network error — please check your connection and try again.");
     } finally {
@@ -126,7 +161,7 @@ export default function Home() {
     };
 
     xhr.upload.onload = () => {
-      setPhase("transcribing");
+      setPhase("working");
     };
 
     xhr.onload = () => {
@@ -177,7 +212,8 @@ export default function Home() {
   function handleDownload() {
     if (!displayText || !result) return;
     const blob = new Blob([displayText], { type: "text/plain;charset=utf-8" });
-    const name = result.mode === "link" ? result.videoId : (file?.name ?? "transcript");
+    const name =
+      result.mode === "youtube" ? result.videoId : (file?.name ?? "transcript");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
     link.download = `transcript-${name.replace(/\.[^.]+$/, "")}.txt`;
@@ -192,26 +228,23 @@ export default function Home() {
           Video Transcript Grabber
         </h1>
         <p className="mt-3 text-base text-slate-600">
-          Upload a Google Drive/Vids video (or any video/audio file) — or
-          paste a YouTube link — and get the full transcript in minutes.
+          Paste a YouTube or Google Drive/Vids link, or upload a video file,
+          and get the full transcript.
         </p>
       </header>
 
+      {googleConnected === false && (
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          Google Drive/Vids links won&apos;t work yet on this machine. Run{" "}
+          <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-xs">
+            npm run connect-google
+          </code>{" "}
+          once in your terminal (it opens a browser to log in), then reload
+          this page. YouTube links and file uploads work either way.
+        </div>
+      )}
+
       <div className="mb-4 flex justify-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
-        <button
-          type="button"
-          onClick={() => {
-            setTab("upload");
-            resetOutputs();
-          }}
-          className={`rounded-md px-4 py-2 text-sm font-semibold transition ${
-            tab === "upload"
-              ? "bg-brand-600 text-white"
-              : "text-slate-600 hover:bg-slate-50"
-          }`}
-        >
-          Upload a video file
-        </button>
         <button
           type="button"
           onClick={() => {
@@ -219,16 +252,46 @@ export default function Home() {
             resetOutputs();
           }}
           className={`rounded-md px-4 py-2 text-sm font-semibold transition ${
-            tab === "link"
-              ? "bg-brand-600 text-white"
-              : "text-slate-600 hover:bg-slate-50"
+            tab === "link" ? "bg-brand-600 text-white" : "text-slate-600 hover:bg-slate-50"
           }`}
         >
-          Paste a YouTube link
+          Paste a link
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setTab("upload");
+            resetOutputs();
+          }}
+          className={`rounded-md px-4 py-2 text-sm font-semibold transition ${
+            tab === "upload" ? "bg-brand-600 text-white" : "text-slate-600 hover:bg-slate-50"
+          }`}
+        >
+          Upload a video file
         </button>
       </div>
 
-      {tab === "upload" ? (
+      {tab === "link" ? (
+        <form
+          onSubmit={handleLinkSubmit}
+          className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center"
+        >
+          <input
+            type="text"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://docs.google.com/videos/d/... or a YouTube link"
+            className="flex-1 rounded-lg border border-slate-300 px-4 py-3 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+          />
+          <button
+            type="submit"
+            disabled={loading || !url.trim()}
+            className="inline-flex items-center justify-center rounded-lg bg-brand-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loading ? "Working…" : "Get transcript"}
+          </button>
+        </form>
+      ) : (
         <form
           onSubmit={handleUploadSubmit}
           className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
@@ -247,9 +310,7 @@ export default function Home() {
             }}
             onClick={() => fileInputRef.current?.click()}
             className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-10 text-center transition ${
-              isDragging
-                ? "border-brand-500 bg-brand-50"
-                : "border-slate-300 hover:border-brand-400"
+              isDragging ? "border-brand-500 bg-brand-50" : "border-slate-300 hover:border-brand-400"
             }`}
           >
             <input
@@ -272,8 +333,7 @@ export default function Home() {
                   Drag & drop a video here, or click to choose a file
                 </p>
                 <p className="mt-1 text-xs text-slate-400">
-                  Download the video from Google Drive/Vids first, then drop
-                  it here. MP4, MOV, WEBM, MP3, WAV — up to 2GB.
+                  MP4, MOV, WEBM, MP3, WAV — up to 2GB.
                 </p>
               </>
             )}
@@ -287,17 +347,8 @@ export default function Home() {
                   style={{ width: `${uploadPct}%` }}
                 />
               </div>
-              <span className="w-12 text-right text-xs text-slate-500">
-                {uploadPct}%
-              </span>
+              <span className="w-12 text-right text-xs text-slate-500">{uploadPct}%</span>
             </div>
-          )}
-          {phase === "transcribing" && (
-            <p className="text-center text-sm text-slate-600">
-              Uploaded. Transcribing audio now — this can take a few minutes
-              for longer videos (first run also downloads the speech model,
-              ~150–300MB, one time only)…
-            </p>
           )}
 
           <div className="flex justify-center gap-2">
@@ -319,26 +370,14 @@ export default function Home() {
             )}
           </div>
         </form>
-      ) : (
-        <form
-          onSubmit={handleLinkSubmit}
-          className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center"
-        >
-          <input
-            type="text"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://www.youtube.com/watch?v=..."
-            className="flex-1 rounded-lg border border-slate-300 px-4 py-3 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-          />
-          <button
-            type="submit"
-            disabled={loading || !url.trim()}
-            className="inline-flex items-center justify-center rounded-lg bg-brand-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {loading ? "Fetching…" : "Get transcript"}
-          </button>
-        </form>
+      )}
+
+      {phase === "working" && (
+        <p className="mt-4 text-center text-sm text-slate-600">
+          Transcribing audio now — this can take a few minutes for longer
+          videos (first run also downloads the speech model, ~150–300MB, one
+          time only)…
+        </p>
       )}
 
       {error && (
@@ -383,9 +422,10 @@ export default function Home() {
       )}
 
       <footer className="mt-auto pt-12 text-center text-xs text-slate-400">
-        Uploaded files are transcribed locally on this server and deleted
-        immediately after. YouTube links need captions (manual or
-        auto-generated) to be available.
+        Drive/Vids links use your own logged-in Google session on this
+        machine and only work for videos you already have view access to.
+        Uploaded files are transcribed locally and deleted immediately
+        after. YouTube links need captions to be available.
       </footer>
     </main>
   );
